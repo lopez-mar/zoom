@@ -1,5 +1,4 @@
-;;; zoom.el --- Fixed and automatic balanced window layout
-
+;;; zoom.el --- Fixed and automatic balanced window layout -*- lexical-binding:
 ;; Copyright (c) 2025 Andrea Cardaci <cyrus.and@gmail.com>
 ;;
 ;; Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -136,21 +135,27 @@ than few lines."
 
 (defun zoom--on ()
   "Enable hooks and advices and update the layout."
-  ;; register the zoom handler
-  (add-function :after pre-redisplay-function #'zoom--handler)
+  ;; register the zoom handlers
+  (add-hook 'window-selection-change-functions #'zoom--window-selection-change)
+  (add-hook 'window-configuration-change-hook #'zoom--configuration-change)
+  (add-hook 'window-buffer-change-functions #'zoom--buffer-change)
   ;; disable mouse resizing
   (advice-add #'mouse-drag-mode-line :override #'ignore)
   (advice-add #'mouse-drag-vertical-line :override #'ignore)
   (advice-add #'mouse-drag-header-line :override #'ignore)
   ;; update the layout once loaded
-  (dolist (frame (frame-list))
-    (with-selected-frame frame
-      (zoom--handler))))
+  (zoom--do-update t))
 
 (defun zoom--off ()
   "Disable hooks and advices and evenly balance the windows."
-  ;; unregister the zoom handler
-  (remove-function pre-redisplay-function #'zoom--handler)
+  ;; unregister the zoom handlers
+  (remove-hook 'window-selection-change-functions #'zoom--window-selection-change)
+  (remove-hook 'window-configuration-change-hook #'zoom--configuration-change)
+  (remove-hook 'window-buffer-change-functions #'zoom--buffer-change)
+  ;; cleanup timer
+  (when zoom--update-timer
+    (cancel-timer zoom--update-timer)
+    (setq zoom--update-timer nil))
   ;; enable mouse resizing
   (advice-remove #'mouse-drag-mode-line #'ignore)
   (advice-remove #'mouse-drag-vertical-line #'ignore)
@@ -162,51 +167,47 @@ than few lines."
 (defvar zoom--last-window nil
   "Keep track of the currently selected window.")
 
-(defun zoom--get-frame-snapshot ()
-  "Get a snapshot of the current frame.
+(defvar zoom--update-timer nil
+  "Timer for debouncing zoom updates.")
 
-The return value is used to determine if an update is needed."
-  ;; the windows size is added to update the layout during the frame resize (XXX
-  ;; note that the simple frame size is not enough because for some reason it's
-  ;; not properly updated during maximize/restore operations); the mouse
-  ;; tracking invalidates the condition so it is possible to delay the update
-  ;; during a mouse tracking event; the list is converted to string to also
-  ;; compare the buffer (the order of the list places the selected window first)
+(defun zoom--window-selection-change (frame)
+  "Handle window selection change in FRAME."
+  (when (and zoom-mode (eq frame (selected-frame)))
+    (zoom--schedule-update)))
 
-  ;; TODO adding the window sizes here causes one spurious update because first
-  ;; the selected window is changed then the resize happens
-  (format "%s" (list (default-value 'track-mouse)
-                     (mapcar (lambda (window) (list window
-                                                    (window-total-width)
-                                                    (window-total-height)))
-                             (window-list)))))
+(defun zoom--configuration-change ()
+  "Handle window configuration change."
+  (when zoom-mode
+    (zoom--schedule-update 'balance)))
 
-(defun zoom--handler (&optional ignored)
-  "Handle an update event.
+(defun zoom--buffer-change (window)
+  "Handle buffer change in WINDOW."
+  (when (and zoom-mode (eq window (selected-window)))
+    (set-window-parameter window 'zoom--ignored 'unknown)
+    (zoom--schedule-update)))
 
-Argument IGNORED is ignored."
-  ;; check if the windows have changed since the last time
-  (let ((snapshot (zoom--get-frame-snapshot)))
-    (unless (equal (frame-parameter nil 'zoom--frame-snapshot) snapshot)
-      ;; update the windows snapshot
-      (set-frame-parameter nil 'zoom--frame-snapshot snapshot)
-      ;; zoom the previously selected window if a mouse tracking is in progress
-      ;; of if the minibuffer is selected (according to the user preference)
-      (with-selected-window
-          (if (and (window-valid-p zoom--last-window) ; might be deleted
-                   (or (equal (selected-window) zoom--last-window)
-                       (and zoom-minibuffer-preserve-layout (window-minibuffer-p))
-                       (default-value 'track-mouse)))
-              zoom--last-window
-            ;; XXX this can't be simply omitted because it's needed to address
-            ;; the case where a window changes buffer from/to a ignored buffer
-            (selected-window))
-        ;; update the currently zoomed window
-        (setq zoom--last-window (selected-window))
-        (zoom--update)))))
+(defun zoom--schedule-update (&optional balance)
+  "Schedule a zoom update, optionally with BALANCE."
+  (when zoom--update-timer
+    (cancel-timer zoom--update-timer))
+  (let ((do-balance balance))  ; capture the value
+    (setq zoom--update-timer
+          (run-with-idle-timer 0.01 nil
+                             (lambda ()
+                               (setq zoom--update-timer nil)
+                               (zoom--do-update do-balance))))))
 
-(defun zoom--update ()
-  "Update the window layout in the current frame."
+(defun zoom--do-update (&optional balance)
+  "Perform the actual update, optionally BALANCE windows first."
+  (when (window-valid-p (selected-window))
+    (let ((window (selected-window)))
+      (unless (equal window zoom--last-window)
+        (setq zoom--last-window window))
+      (zoom--update balance))))
+
+(defun zoom--update (&optional balance)
+  "Update the window layout in the current frame.
+If BALANCE is non-nil, balance windows first."
   (let (;; temporarily disables this mode during resize to avoid infinite
         ;; recursion (probably not needed thanks to the following)
         (zoom-mode nil)
@@ -220,8 +221,9 @@ Argument IGNORED is ignored."
         ;; make sure that the exact same amount of pixels is assigned to all the
         ;; siblings
         (window-resize-pixelwise t))
-    ;; start from a balanced layout anyway
-    (balance-windows)
+    ;; only balance when explicitly requested (e.g., configuration changes)
+    (when balance
+      (balance-windows))
     ;; check if the selected window is not ignored
     (unless (zoom--window-ignored-p)
       (zoom--resize)
@@ -231,27 +233,33 @@ Argument IGNORED is ignored."
 
 (defun zoom--window-ignored-p ()
   "Check whether the selected window will be ignored or not."
-  (or
-   ;; `one-window-p' does not work well with the completion buffer
-   ;; when emacsclient is used
-   (frame-root-window-p (selected-window))
-   ;; never attempt to zoom the minibuffer
-   (window-minibuffer-p)
-   ;; check against the major mode (or its parents) (XXX this way of invoking
-   ;; `derived-mode-p' has been deprecated in Emacs 30 but it still works)
-   (apply 'derived-mode-p zoom-ignored-major-modes)
-   ;; check against the buffer name
-   (member (buffer-name) zoom-ignored-buffer-names)
-   ;; check against the buffer name (using a regexp)
-   (catch 'ignored
-     (dolist (regex zoom-ignored-buffer-name-regexps)
-       (when (string-match regex (buffer-name))
-         (throw 'ignored t))))
-   ;; check user-defined predicates
-   (catch 'ignored
-     (dolist (predicate zoom-ignore-predicates)
-       (when (funcall predicate)
-         (throw 'ignored t))))))
+  (let ((cached (window-parameter nil 'zoom--ignored)))
+    (if (eq cached 'unknown)
+        (let ((ignored
+               (or
+                ;; `one-window-p' does not work well with the completion buffer
+                ;; when emacsclient is used
+                (frame-root-window-p (selected-window))
+                ;; never attempt to zoom the minibuffer
+                (window-minibuffer-p)
+                ;; check against the major mode (or its parents) (XXX this way of invoking
+                ;; `derived-mode-p' has been deprecated in Emacs 30 but it still works)
+                (apply 'derived-mode-p zoom-ignored-major-modes)
+                ;; check against the buffer name
+                (member (buffer-name) zoom-ignored-buffer-names)
+                ;; check against the buffer name (using a regexp)
+                (catch 'ignored
+                  (dolist (regex zoom-ignored-buffer-name-regexps)
+                    (when (string-match regex (buffer-name))
+                      (throw 'ignored t))))
+                ;; check user-defined predicates
+                (catch 'ignored
+                  (dolist (predicate zoom-ignore-predicates)
+                    (when (funcall predicate)
+                      (throw 'ignored t)))))))
+          (set-window-parameter nil 'zoom--ignored ignored)
+          ignored)
+      cached)))
 
 (defun zoom--resize ()
   "Resize the selected window according to the user preference."
