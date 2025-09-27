@@ -190,12 +190,11 @@ than few lines."
   "Schedule a zoom update, optionally with BALANCE."
   (when zoom--update-timer
     (cancel-timer zoom--update-timer))
-  (let ((do-balance balance))  ; capture the value
-    (setq zoom--update-timer
-          (run-with-idle-timer 0.01 nil
-                             (lambda ()
-                               (setq zoom--update-timer nil)
-                               (zoom--do-update do-balance))))))
+  (setq zoom--update-timer
+        (run-with-idle-timer 0.01 nil
+                           (lambda ()
+                             (setq zoom--update-timer nil)
+                             (zoom--do-update balance)))))
 
 (defun zoom--do-update (&optional balance)
   "Perform the actual update, optionally BALANCE windows first."
@@ -293,8 +292,15 @@ resized horizontally or vertically."
          (desired-delta (max (- min-window-size window-size) 0))
          ;; fall back to the maximum available if the windows are too small
          (delta (window-resizable nil desired-delta horizontal)))
-    ;; actually resize the window
-    (window-resize nil delta horizontal)))
+    ;; actually resize the window, but only if it's safe to do so
+    (when (and (> delta 0)
+               (not (frame-root-window-p (selected-window)))
+               (not (window-minibuffer-p)))
+      (condition-case err
+          (window-resize nil delta horizontal)
+        (error
+         ;; silently ignore resize errors to prevent timer errors
+         nil)))))
 
 (defun zoom--fix-scroll ()
   "Fix the horizontal scrolling if needed."
