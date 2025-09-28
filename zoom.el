@@ -1,4 +1,5 @@
-;;; zoom.el --- Fixed and automatic balanced window layout -*- lexical-binding:
+;;; zoom.el --- Fixed and automatic balanced window layout  -*- lexical-binding: t; -*-
+
 ;; Copyright (c) 2025 Andrea Cardaci <cyrus.and@gmail.com>
 ;;
 ;; Permission is hereby granted, free of charge, to any person obtaining a copy
