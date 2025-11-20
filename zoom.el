@@ -73,8 +73,10 @@ Otherwise also consider, margins, fringes, header line, etc."
   "List of ignored major modes.
 
 Selected windows displaying a buffer with a major mode that is
-derived from any of these major modes should not be
-enlarged (only balanced)."
+derived from any of these major modes should not be enlarged.
+Additionally, if ANY window in the frame matches these criteria,
+automatic window balancing will be skipped to preserve custom
+layouts (e.g., for ediff)."
   :type '(repeat symbol)
   :group 'zoom)
 
@@ -82,7 +84,9 @@ enlarged (only balanced)."
   "List of ignored buffer names.
 
 Selected windows displaying any of these buffers should not be
-enlarged (only balanced)."
+enlarged.  Additionally, if ANY window in the frame matches these
+criteria, automatic window balancing will be skipped to preserve
+custom layouts (e.g., for ediff)."
   :type '(repeat string)
   :group 'zoom)
 
@@ -90,7 +94,9 @@ enlarged (only balanced)."
   "List of ignored buffer name regexps.
 
 Selected windows displaying buffers matching any of these regexps
-should not be enlarged (only balanced)."
+should not be enlarged.  Additionally, if ANY window in the frame
+matches these criteria, automatic window balancing will be skipped
+to preserve custom layouts (e.g., for ediff)."
   :type '(repeat regexp)
   :group 'zoom)
 
@@ -98,10 +104,18 @@ should not be enlarged (only balanced)."
   "List of additional predicates that allow to ignore windows.
 
 These functions are called (in order) to decide whether the
-selected window should be ignored (only balanced) or not.
-Predicates take no parameters and as soon as one function returns
-a non-nil value, the selected window is ignored and the others
-are not called."
+selected window should be ignored or not.  Predicates take no
+parameters and as soon as one function returns a non-nil value,
+the selected window is ignored and the others are not called.
+
+When a window is ignored, it will not be enlarged.  Additionally,
+if ANY window in the frame is ignored, automatic window balancing
+will be skipped to preserve custom layouts (e.g., for ediff).
+
+Example for ediff integration:
+  (add-to-list 'zoom-ignore-predicates
+               (lambda () (and (boundp 'ediff-this-buffer-ediff-sessions)
+                          ediff-this-buffer-ediff-sessions)))"
   :type '(repeat function)
   :group 'zoom)
 
@@ -114,6 +128,12 @@ useful when third-party modes use the minibuffer to display more
 than few lines."
   :type 'boolean
   :group 'zoom)
+
+(defvar zoom-disabled nil
+  "When non-nil, temporarily disable all zoom operations.
+This can be used to bypass zoom for specific operations without
+turning off zoom-mode entirely.  Useful for modes that manage
+their own window layout.")
 
 ;;;###autoload
 (define-minor-mode zoom-mode
@@ -222,7 +242,8 @@ If BALANCE is non-nil, balance windows first."
         ;; siblings
         (window-resize-pixelwise t))
     ;; only balance when explicitly requested (e.g., configuration changes)
-    (when balance
+    ;; and when no ignored windows are present
+    (when (and balance (not (zoom--any-window-ignored-p)))
       (balance-windows))
     ;; check if the selected window is not ignored
     (unless (zoom--window-ignored-p)
@@ -233,33 +254,69 @@ If BALANCE is non-nil, balance windows first."
 
 (defun zoom--window-ignored-p ()
   "Check whether the selected window will be ignored or not."
-  (let ((cached (window-parameter nil 'zoom--ignored)))
-    (if (eq cached 'unknown)
-        (let ((ignored
-               (or
-                ;; `one-window-p' does not work well with the completion buffer
-                ;; when emacsclient is used
-                (frame-root-window-p (selected-window))
-                ;; never attempt to zoom the minibuffer
-                (window-minibuffer-p)
-                ;; check against the major mode (or its parents) (XXX this way of invoking
-                ;; `derived-mode-p' has been deprecated in Emacs 30 but it still works)
-                (apply 'derived-mode-p zoom-ignored-major-modes)
-                ;; check against the buffer name
-                (member (buffer-name) zoom-ignored-buffer-names)
-                ;; check against the buffer name (using a regexp)
-                (catch 'ignored
-                  (dolist (regex zoom-ignored-buffer-name-regexps)
-                    (when (string-match regex (buffer-name))
-                      (throw 'ignored t))))
-                ;; check user-defined predicates
-                (catch 'ignored
-                  (dolist (predicate zoom-ignore-predicates)
-                    (when (funcall predicate)
-                      (throw 'ignored t)))))))
-          (set-window-parameter nil 'zoom--ignored ignored)
-          ignored)
-      cached)))
+  (or
+   ;; check global disable flag first
+   zoom-disabled
+   ;; check cache and predicates
+   (let ((cached (window-parameter nil 'zoom--ignored)))
+     ;; treat nil (unset) and 'unknown the same: evaluate predicates
+     (if (or (null cached) (eq cached 'unknown))
+         (let ((ignored
+                (or
+                 ;; `one-window-p' does not work well with the completion buffer
+                 ;; when emacsclient is used
+                 (frame-root-window-p (selected-window))
+                 ;; never attempt to zoom the minibuffer
+                 (window-minibuffer-p)
+                 ;; check against the major mode (or its parents) (XXX this way of invoking
+                 ;; `derived-mode-p' has been deprecated in Emacs 30 but it still works)
+                 (apply 'derived-mode-p zoom-ignored-major-modes)
+                 ;; check against the buffer name
+                 (member (buffer-name) zoom-ignored-buffer-names)
+                 ;; check against the buffer name (using a regexp)
+                 (catch 'ignored
+                   (dolist (regex zoom-ignored-buffer-name-regexps)
+                     (when (string-match regex (buffer-name))
+                       (throw 'ignored t))))
+                 ;; check user-defined predicates
+                 (catch 'ignored
+                   (dolist (predicate zoom-ignore-predicates)
+                     (when (funcall predicate)
+                       (throw 'ignored t)))))))
+           (set-window-parameter nil 'zoom--ignored ignored)
+           ignored)
+       cached))))
+
+(defun zoom--any-window-ignored-p ()
+  "Check whether any window in the current frame/tab would be ignored.
+This function always re-evaluates predicates without using the cache
+to avoid stale data when buffers change in non-selected windows.
+It's also tab-aware to prevent cross-tab contamination."
+  (or
+   ;; check global disable flag first
+   zoom-disabled
+   ;; check all windows in the current tab's configuration, forcing fresh evaluation
+   (catch 'found
+     (dolist (window (window-list nil 'no-minibuffer))
+       (with-selected-window window
+         ;; Temporarily mark cache as unknown to force re-evaluation
+         (let ((old-cache (window-parameter window 'zoom--ignored)))
+           (unwind-protect
+               (progn
+                 (set-window-parameter window 'zoom--ignored 'unknown)
+                 (when (zoom--window-ignored-p)
+                   (throw 'found t)))
+             ;; Don't restore old cache - let it be re-evaluated next time
+             ))))
+     nil)))
+
+(defmacro zoom-with-disable (&rest body)
+  "Execute BODY with zoom temporarily disabled.
+This sets `zoom-disabled' to t, executes BODY, and restores the
+previous value of `zoom-disabled'."
+  (declare (indent 0) (debug t))
+  `(let ((zoom-disabled t))
+     ,@body))
 
 (defun zoom--resize ()
   "Resize the selected window according to the user preference."
