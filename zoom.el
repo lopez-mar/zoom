@@ -129,11 +129,97 @@ than few lines."
   :type 'boolean
   :group 'zoom)
 
+(defcustom zoom-mode-per-tab nil
+  "When non-nil, zoom-mode operates on a per-tab basis.
+
+When enabled, zoom-mode state is tracked separately for each tab,
+and zoom operations only affect windows in the current tab.  This
+allows you to enable zoom-mode in some tabs while leaving it
+disabled in others.
+
+Use `zoom-mode-tab-toggle' to toggle zoom for the current tab when
+this option is enabled.
+
+Note: Requires Emacs with tab-bar support (Emacs 27.1+)."
+  :type 'boolean
+  :group 'zoom)
+
 (defvar zoom-disabled nil
   "When non-nil, temporarily disable all zoom operations.
 This can be used to bypass zoom for specific operations without
 turning off zoom-mode entirely.  Useful for modes that manage
 their own window layout.")
+
+;;; Tab-local zoom support
+
+(defvar zoom--per-tab-state (make-hash-table :test 'equal)
+  "Hash table storing per-tab zoom enabled state.
+Keys are tab names (strings), values are booleans.")
+
+(defun zoom--tab-bar-available-p ()
+  "Return non-nil if tab-bar functionality is available."
+  (and (fboundp 'tab-bar-tabs)
+       (fboundp 'tab-bar--current-tab-index)))
+
+(defun zoom--get-current-tab-name ()
+  "Get the name of the current tab, or nil if tab-bar is not available."
+  (when (zoom--tab-bar-available-p)
+    (let* ((tabs (funcall tab-bar-tabs-function))
+           (current-index (tab-bar--current-tab-index tabs))
+           (current-tab (nth current-index tabs)))
+      (alist-get 'name current-tab))))
+
+(defun zoom--tab-zoom-enabled-p ()
+  "Return non-nil if zoom is enabled for the current tab.
+When `zoom-mode-per-tab' is nil, returns the value of `zoom-mode'.
+When `zoom-mode-per-tab' is t, returns the tab-local zoom state."
+  (if zoom-mode-per-tab
+      (let ((tab-name (zoom--get-current-tab-name)))
+        (if tab-name
+            ;; Default to zoom-mode when zoom-enabled is not set for this tab
+            (gethash tab-name zoom--per-tab-state zoom-mode)
+          ;; Fallback to global zoom-mode if tab-bar is not available
+          zoom-mode))
+    ;; When not in per-tab mode, use global zoom-mode
+    zoom-mode))
+
+(defun zoom--set-tab-zoom-enabled (enabled)
+  "Set zoom enabled state for the current tab to ENABLED."
+  (when (zoom--tab-bar-available-p)
+    (let ((tab-name (zoom--get-current-tab-name)))
+      (when tab-name
+        (puthash tab-name enabled zoom--per-tab-state)))))
+
+;;;###autoload
+(defun zoom-mode-tab-toggle ()
+  "Toggle zoom-mode for the current tab.
+This command only works when `zoom-mode-per-tab' is enabled.
+Use `zoom-mode' to toggle zoom globally instead."
+  (interactive)
+  (if (not zoom-mode-per-tab)
+      (message "Set `zoom-mode-per-tab' to t to use per-tab zoom")
+    (if (not (zoom--tab-bar-available-p))
+        (message "Tab-bar functionality not available")
+      (let* ((current-enabled (zoom--tab-zoom-enabled-p))
+             (new-state (not current-enabled)))
+        (zoom--set-tab-zoom-enabled new-state)
+        (if new-state
+            (progn
+              (message "Zoom enabled for this tab")
+              (zoom--do-update t))
+          (progn
+            (message "Zoom disabled for this tab")
+            (balance-windows)))))))
+
+(defun zoom--tab-post-select (_tab)
+  "Handle tab selection to update zoom state for the new tab.
+Argument _TAB is the newly selected tab (unused)."
+  (when (and zoom-mode zoom-mode-per-tab)
+    (if (zoom--tab-zoom-enabled-p)
+        ;; Zoom is enabled for this tab, apply zoom
+        (zoom--do-update t)
+      ;; Zoom is disabled for this tab, just balance windows
+      (balance-windows))))
 
 ;;;###autoload
 (define-minor-mode zoom-mode
@@ -160,6 +246,9 @@ their own window layout.")
   (add-hook 'window-selection-change-functions #'zoom--window-selection-change)
   (add-hook 'window-configuration-change-hook #'zoom--configuration-change)
   (add-hook 'window-buffer-change-functions #'zoom--buffer-change)
+  ;; register tab-switching handler if per-tab mode and tab-bar is available
+  (when (and zoom-mode-per-tab (zoom--tab-bar-available-p))
+    (add-hook 'tab-bar-tab-post-select-functions #'zoom--tab-post-select))
   ;; disable mouse resizing
   (advice-add #'mouse-drag-mode-line :override #'ignore)
   (advice-add #'mouse-drag-vertical-line :override #'ignore)
@@ -173,6 +262,8 @@ their own window layout.")
   (remove-hook 'window-selection-change-functions #'zoom--window-selection-change)
   (remove-hook 'window-configuration-change-hook #'zoom--configuration-change)
   (remove-hook 'window-buffer-change-functions #'zoom--buffer-change)
+  ;; unregister tab-switching handler
+  (remove-hook 'tab-bar-tab-post-select-functions #'zoom--tab-post-select)
   ;; cleanup timer
   (when zoom--update-timer
     (cancel-timer zoom--update-timer)
@@ -193,17 +284,21 @@ their own window layout.")
 
 (defun zoom--window-selection-change (frame)
   "Handle window selection change in FRAME."
-  (when (and zoom-mode (eq frame (selected-frame)))
+  (when (and zoom-mode
+             (eq frame (selected-frame))
+             (zoom--tab-zoom-enabled-p))
     (zoom--schedule-update)))
 
 (defun zoom--configuration-change ()
   "Handle window configuration change."
-  (when zoom-mode
+  (when (and zoom-mode (zoom--tab-zoom-enabled-p))
     (zoom--schedule-update 'balance)))
 
 (defun zoom--buffer-change (window)
   "Handle buffer change in WINDOW."
-  (when (and zoom-mode (eq window (selected-window)))
+  (when (and zoom-mode
+             (eq window (selected-window))
+             (zoom--tab-zoom-enabled-p))
     (set-window-parameter window 'zoom--ignored 'unknown)
     (zoom--schedule-update)))
 
@@ -300,14 +395,9 @@ It's also tab-aware to prevent cross-tab contamination."
      (dolist (window (window-list nil 'no-minibuffer))
        (with-selected-window window
          ;; Temporarily mark cache as unknown to force re-evaluation
-         (let ((old-cache (window-parameter window 'zoom--ignored)))
-           (unwind-protect
-               (progn
-                 (set-window-parameter window 'zoom--ignored 'unknown)
-                 (when (zoom--window-ignored-p)
-                   (throw 'found t)))
-             ;; Don't restore old cache - let it be re-evaluated next time
-             ))))
+         (set-window-parameter window 'zoom--ignored 'unknown)
+         (when (zoom--window-ignored-p)
+           (throw 'found t))))
      nil)))
 
 (defmacro zoom-with-disable (&rest body)
@@ -354,7 +444,7 @@ resized horizontally or vertically."
     (when (and (> delta 0)
                (not (frame-root-window-p (selected-window)))
                (not (window-minibuffer-p)))
-      (condition-case err
+      (condition-case _err
           (window-resize nil delta horizontal)
         (error
          ;; silently ignore resize errors to prevent timer errors
